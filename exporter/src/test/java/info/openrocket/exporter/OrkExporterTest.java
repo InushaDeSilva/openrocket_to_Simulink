@@ -6,6 +6,7 @@ import us.hebi.matlab.mat.format.Mat5File;
 import us.hebi.matlab.mat.types.MatFile;
 import us.hebi.matlab.mat.types.Matrix;
 import us.hebi.matlab.mat.types.Char;
+import us.hebi.matlab.mat.types.Struct;
 import us.hebi.matlab.mat.types.Sources;
 
 import java.io.File;
@@ -61,6 +62,8 @@ class OrkExporterTest {
         args.add("0.5");
         args.add("--aoa-step");
         args.add("5.0");
+        args.add("--alt-step");
+        args.add("2500.0");
         args.addAll(java.util.Arrays.asList(extraArgs));
 
         return new picocli.CommandLine(new OrkExporter()).execute(args.toArray(new String[0]));
@@ -166,25 +169,31 @@ class OrkExporterTest {
         assertTrue(refArea > 0, "Reference area must be positive");
         assertTrue(refLength > 0, "Reference length must be positive");
 
-        // CD table
+        // CD table (now 3D: Mach x AoA x Alt)
         Matrix cdTable = mat.getMatrix("CD_table");
         assertNotNull(cdTable, "CD_table must exist");
-        int nMach = cdTable.getNumRows();
-        int nAoA = cdTable.getNumCols();
+        int[] cdDims = cdTable.getDimensions();
+        assertTrue(cdDims.length == 3, "CD_table must be 3D (Mach x AoA x Alt), got " + cdDims.length + "D");
+        int nMach = cdDims[0];
+        int nAoA = cdDims[1];
+        int nAlt = cdDims[2];
         assertTrue(nMach >= 2, "CD table must have multiple Mach points");
         assertTrue(nAoA >= 1, "CD table must have AoA points");
+        assertTrue(nAlt >= 1, "CD table must have altitude points");
 
-        // CD should be positive for all non-zero Mach
+        // CD should be positive for all non-zero Mach (check at first alt)
         for (int i = 0; i < nMach; i++) {
-            double cd = cdTable.getDouble(i, 0);
+            double cd = cdTable.getDouble(new int[]{i, 0, 0});
             assertTrue(cd > 0 && cd < 10, "CD should be positive and reasonable at Mach idx " + i + " (got " + cd + ")");
         }
 
         // Breakpoints
         double[] machBp = getRow(mat, "mach_bp");
         double[] aoaBp = getRow(mat, "aoa_bp");
-        assertEquals(nMach, machBp.length, "Mach breakpoints must match CD table rows");
-        assertEquals(nAoA, aoaBp.length, "AoA breakpoints must match CD table columns");
+        double[] altBp = getRow(mat, "alt_bp");
+        assertEquals(nMach, machBp.length, "Mach breakpoints must match CD table dim 1");
+        assertEquals(nAoA, aoaBp.length, "AoA breakpoints must match CD table dim 2");
+        assertEquals(nAlt, altBp.length, "Alt breakpoints must match CD table dim 3");
 
         // Additional aero tables should exist
         assertNotNull(mat.getMatrix("CN_table"), "CN_table must exist");
@@ -435,15 +444,16 @@ class OrkExporterTest {
         assertNotNull(baseCd);
 
         // Total CD should be approximately >= sum of components (there may be rounding/override)
-        int nMach = cdTable.getNumRows();
-        int nAoA = cdTable.getNumCols();
+        int[] cdDims = cdTable.getDimensions();
+        int nMach = cdDims[0];
+        int nAoA = cdDims[1];
 
         for (int i = 0; i < Math.min(nMach, 3); i++) {
             for (int j = 0; j < Math.min(nAoA, 2); j++) {
-                double total = cdTable.getDouble(i, j);
-                double pressure = pressureCd.getDouble(i, j);
-                double friction = frictionCd.getDouble(i, j);
-                double base = baseCd.getDouble(i, j);
+                double total = cdTable.getDouble(new int[]{i, j, 0});
+                double pressure = pressureCd.getDouble(new int[]{i, j, 0});
+                double friction = frictionCd.getDouble(new int[]{i, j, 0});
+                double base = baseCd.getDouble(new int[]{i, j, 0});
 
                 // All components should be non-negative
                 assertTrue(pressure >= 0, "Pressure CD must be non-negative");
@@ -456,6 +466,436 @@ class OrkExporterTest {
                         "Total CD (" + total + ") should be >= ~sum of components (" + componentSum + ")");
             }
         }
+
+        mat.close();
+    }
+
+    // ─── New v2.0 Tests ──────────────────────────────────────────────
+
+    @Test
+    @Order(10)
+    @DisplayName("Metadata struct exists and has required fields")
+    void testMetadataStruct() throws Exception {
+        String orkFile = EXAMPLES_DIR + "A simple model rocket.ork";
+        String matPath = tempDir.resolve("simple_meta.mat").toString();
+
+        int exitCode = runExporter(orkFile, matPath);
+        assertEquals(0, exitCode);
+
+        Mat5File mat = loadMat(matPath);
+
+        // meta struct must exist
+        Struct meta = mat.getStruct("meta");
+        assertNotNull(meta, "meta struct must exist in MAT file");
+
+        // Check key string fields are non-empty
+        Char orVersion = meta.getChar("openrocket_version");
+        assertNotNull(orVersion, "meta.openrocket_version must exist");
+
+        Char exporterVersion = meta.getChar("exporter_version");
+        assertNotNull(exporterVersion, "meta.exporter_version must exist");
+        assertEquals("2.1.0", exporterVersion.getString(), "Exporter version must be 2.1.0");
+
+        Char sha256 = meta.getChar("ork_sha256");
+        assertNotNull(sha256, "meta.ork_sha256 must exist");
+        assertTrue(sha256.getString().length() == 64, "SHA-256 hash must be 64 hex chars");
+
+        // Check coordinate conventions
+        Char coordOrigin = meta.getChar("coord_origin");
+        assertNotNull(coordOrigin, "meta.coord_origin must exist");
+        assertEquals("nose_tip", coordOrigin.getString());
+
+        Char inertiaFrame = meta.getChar("inertia_frame");
+        assertNotNull(inertiaFrame, "meta.inertia_frame must exist");
+
+        mat.close();
+    }
+
+    @Test
+    @Order(11)
+    @DisplayName("Separated mass properties are consistent")
+    void testSeparatedMassProperties() throws Exception {
+        String orkFile = EXAMPLES_DIR + "A simple model rocket.ork";
+        String matPath = tempDir.resolve("simple_separated_mass.mat").toString();
+
+        int exitCode = runExporter(orkFile, matPath);
+        assertEquals(0, exitCode);
+
+        Mat5File mat = loadMat(matPath);
+
+        double mStructure = getScalar(mat, "m_structure");
+        double mMotorLaunch = getScalar(mat, "m_motor_launch");
+        double mTotalLaunch = getScalar(mat, "m_total_launch");
+        double mTotalBurnout = getScalar(mat, "m_total_burnout");
+
+        assertTrue(mStructure > 0, "m_structure must be positive");
+        assertTrue(mMotorLaunch > 0, "m_motor_launch must be positive");
+        assertTrue(mTotalLaunch > 0, "m_total_launch must be positive");
+        assertTrue(mTotalBurnout > 0, "m_total_burnout must be positive");
+
+        // m_total_launch ≈ m_structure + m_motor_launch
+        assertEquals(mTotalLaunch, mStructure + mMotorLaunch, 1e-4,
+                "m_total_launch must ≈ m_structure + m_motor_launch");
+
+        // Structure inertias must exist and be non-negative
+        assertTrue(getScalar(mat, "I_structure_yy") >= 0, "I_structure_yy must be non-negative");
+        assertTrue(getScalar(mat, "I_motor_launch_yy") >= 0, "I_motor_launch_yy must be non-negative");
+        assertTrue(getScalar(mat, "I_total_launch_yy") >= 0, "I_total_launch_yy must be non-negative");
+
+        mat.close();
+    }
+
+    @Test
+    @Order(12)
+    @DisplayName("Time arrays are strictly monotonic")
+    void testMonotonicTimeGuarantee() throws Exception {
+        String orkFile = EXAMPLES_DIR + "A simple model rocket.ork";
+        String matPath = tempDir.resolve("simple_monotonic.mat").toString();
+
+        int exitCode = runExporter(orkFile, matPath);
+        assertEquals(0, exitCode);
+
+        Mat5File mat = loadMat(matPath);
+
+        // Check thrust_time is strictly increasing
+        double[] thrustTime = getRow(mat, "thrust_time");
+        for (int i = 1; i < thrustTime.length; i++) {
+            assertTrue(thrustTime[i] > thrustTime[i - 1],
+                    "thrust_time must be strictly increasing at index " + i +
+                    " (got " + thrustTime[i-1] + " -> " + thrustTime[i] + ")");
+        }
+
+        // Check mass_time is strictly increasing
+        double[] massTime = getRow(mat, "mass_time");
+        for (int i = 1; i < massTime.length; i++) {
+            assertTrue(massTime[i] > massTime[i - 1],
+                    "mass_time must be strictly increasing at index " + i +
+                    " (got " + massTime[i-1] + " -> " + massTime[i] + ")");
+        }
+
+        mat.close();
+    }
+
+    @Test
+    @Order(13)
+    @DisplayName("dI/dt arrays exist and have correct length")
+    void testDIdtArrays() throws Exception {
+        String orkFile = EXAMPLES_DIR + "A simple model rocket.ork";
+        String matPath = tempDir.resolve("simple_didt.mat").toString();
+
+        int exitCode = runExporter(orkFile, matPath);
+        assertEquals(0, exitCode);
+
+        Mat5File mat = loadMat(matPath);
+
+        double[] massTime = getRow(mat, "mass_time");
+        double[] dIxxDt = getRow(mat, "dIxx_dt");
+        double[] dIyyDt = getRow(mat, "dIyy_dt");
+        double[] dIzzDt = getRow(mat, "dIzz_dt");
+
+        assertEquals(massTime.length, dIxxDt.length, "dIxx_dt must have same length as mass_time");
+        assertEquals(massTime.length, dIyyDt.length, "dIyy_dt must have same length as mass_time");
+        assertEquals(massTime.length, dIzzDt.length, "dIzz_dt must have same length as mass_time");
+
+        // dI/dt values should be finite
+        for (int i = 0; i < dIxxDt.length; i++) {
+            assertFalse(Double.isNaN(dIxxDt[i]), "dIxx_dt must not be NaN at index " + i);
+            assertFalse(Double.isInfinite(dIxxDt[i]), "dIxx_dt must not be Inf at index " + i);
+        }
+
+        mat.close();
+    }
+
+    @Test
+    @Order(14)
+    @DisplayName("Fin cant angle is exported for all fin sets")
+    void testFinCantAngle() throws Exception {
+        String orkFile = EXAMPLES_DIR + "A simple model rocket.ork";
+        String matPath = tempDir.resolve("simple_fins.mat").toString();
+
+        int exitCode = runExporter(orkFile, matPath);
+        assertEquals(0, exitCode);
+
+        Mat5File mat = loadMat(matPath);
+
+        double nFinsets = getScalar(mat, "n_finsets");
+        assertTrue(nFinsets >= 1, "Should have at least 1 fin set");
+
+        // fin0_cant_angle_rad must exist
+        Matrix cantAngle = mat.getMatrix("fin0_cant_angle_rad");
+        assertNotNull(cantAngle, "fin0_cant_angle_rad must exist");
+        double cantVal = cantAngle.getDouble(0, 0);
+        assertFalse(Double.isNaN(cantVal), "fin0_cant_angle_rad must not be NaN");
+        // For a simple rocket, cant angle is typically 0
+        assertEquals(0.0, cantVal, 1e-6, "Simple rocket fin cant angle should be 0");
+
+        // Also verify per-finset count, span, thickness
+        Matrix fin0Count = mat.getMatrix("fin0_count");
+        assertNotNull(fin0Count, "fin0_count must exist");
+        assertTrue(fin0Count.getDouble(0, 0) >= 3, "Fin count should be >= 3");
+
+        mat.close();
+    }
+
+    @Test
+    @Order(15)
+    @DisplayName("Burnout tail extends past burn time with zero thrust")
+    void testBurnoutTail() throws Exception {
+        String orkFile = EXAMPLES_DIR + "A simple model rocket.ork";
+        String matPath = tempDir.resolve("simple_burnout.mat").toString();
+
+        int exitCode = runExporter(orkFile, matPath);
+        assertEquals(0, exitCode);
+
+        Mat5File mat = loadMat(matPath);
+
+        double[] thrustTime = getRow(mat, "thrust_time");
+        double[] thrustForce = getRow(mat, "thrust_force");
+        double burnTime = getScalar(mat, "burn_time");
+
+        // Last thrust value must be 0.0
+        assertEquals(0.0, thrustForce[thrustForce.length - 1], 1e-9,
+                "Last thrust value must be 0.0 (far-future hold)");
+
+        // Last time point should extend well past burn time (by ~100s)
+        assertTrue(thrustTime[thrustTime.length - 1] > burnTime + 50,
+                "thrust_time should extend well past burn_time (got " +
+                thrustTime[thrustTime.length - 1] + " vs burn_time=" + burnTime + ")");
+
+        // Second-to-last should also be 0
+        assertEquals(0.0, thrustForce[thrustForce.length - 2], 1e-9,
+                "Second-to-last thrust must also be 0.0 (burnout zero crossing)");
+
+        mat.close();
+    }
+
+    @Test
+    @Order(16)
+    @DisplayName("Additional sim channels are exported with --run-sim")
+    void testAdditionalSimChannels() throws Exception {
+        String orkFile = EXAMPLES_DIR + "A simple model rocket.ork";
+        String matPath = tempDir.resolve("simple_channels.mat").toString();
+
+        int exitCode = runExporter(orkFile, matPath, "--run-sim");
+        assertEquals(0, exitCode);
+
+        Mat5File mat = loadMat(matPath);
+
+        // New channels should exist
+        Matrix orAoa = mat.getMatrix("or_aoa");
+        assertNotNull(orAoa, "or_aoa must exist when --run-sim is used");
+        assertTrue(orAoa.getNumCols() > 0, "or_aoa should have data points");
+
+        Matrix orRollRate = mat.getMatrix("or_roll_rate");
+        assertNotNull(orRollRate, "or_roll_rate must exist when --run-sim is used");
+
+        Matrix orCg = mat.getMatrix("or_cg");
+        assertNotNull(orCg, "or_cg must exist when --run-sim is used");
+
+        Matrix orCp = mat.getMatrix("or_cp");
+        assertNotNull(orCp, "or_cp must exist when --run-sim is used");
+
+        Matrix orStability = mat.getMatrix("or_stability");
+        assertNotNull(orStability, "or_stability must exist when --run-sim is used");
+
+        mat.close();
+    }
+
+    // ─── New v2.1 Tests ──────────────────────────────────────────────
+
+    @Test
+    @Order(17)
+    @DisplayName("3D aero tables have correct Mach x AoA x Alt dimensions")
+    void test3DAeroTableDimensions() throws Exception {
+        String orkFile = EXAMPLES_DIR + "A simple model rocket.ork";
+        String matPath = tempDir.resolve("aero3d.mat").toString();
+
+        int exitCode = runExporter(orkFile, matPath, "--alt-max", "5000");
+        assertEquals(0, exitCode, "Exporter should succeed");
+
+        Mat5File mat = loadMat(matPath);
+
+        // CD_table should be 3D
+        Matrix cdTable = mat.getMatrix("CD_table");
+        assertNotNull(cdTable, "CD_table must exist");
+        int[] dims = cdTable.getDimensions();
+        assertEquals(3, dims.length, "CD_table must be 3-dimensional");
+
+        // alt_bp should exist and match dimension 3
+        double[] altBp = getRow(mat, "alt_bp");
+        assertEquals(dims[2], altBp.length, "alt_bp length must match CD_table dim 3");
+        assertEquals(0.0, altBp[0], 1e-6, "First altitude breakpoint should be 0");
+        assertEquals(5000.0, altBp[altBp.length - 1], 1e-6, "Last altitude breakpoint should be 5000");
+
+        // CD at higher altitude should differ from sea level (Reynolds effect)
+        double cdSeaLevel = cdTable.getDouble(new int[]{1, 0, 0});
+        double cdHighAlt = cdTable.getDouble(new int[]{1, 0, dims[2] - 1});
+        assertNotEquals(cdSeaLevel, cdHighAlt, 1e-9,
+                "CD should differ between sea level and " + altBp[altBp.length - 1] + "m");
+
+        // All aero tables should be 3D
+        for (String tableName : new String[]{"CN_table", "Cm_table", "Croll_table",
+                "CrollDamp_table", "CrollForce_table"}) {
+            Matrix table = mat.getMatrix(tableName);
+            assertNotNull(table, tableName + " must exist");
+            int[] tDims = table.getDimensions();
+            assertEquals(3, tDims.length, tableName + " must be 3D");
+            assertEquals(dims[0], tDims[0], tableName + " dim1 must match CD_table");
+            assertEquals(dims[1], tDims[1], tableName + " dim2 must match CD_table");
+            assertEquals(dims[2], tDims[2], tableName + " dim3 must match CD_table");
+        }
+
+        mat.close();
+    }
+
+    @Test
+    @Order(18)
+    @DisplayName("Motor identity metadata is exported")
+    void testMotorIdentityMetadata() throws Exception {
+        String orkFile = EXAMPLES_DIR + "A simple model rocket.ork";
+        String matPath = tempDir.resolve("motor_identity.mat").toString();
+
+        int exitCode = runExporter(orkFile, matPath);
+        assertEquals(0, exitCode, "Exporter should succeed");
+
+        Mat5File mat = loadMat(matPath);
+
+        // Motor identity fields must exist
+        Char manufacturer = mat.getChar("motor_manufacturer");
+        assertNotNull(manufacturer, "motor_manufacturer must exist");
+        assertTrue(manufacturer.getString().length() > 0, "motor_manufacturer must be non-empty");
+
+        double totalImpulse = getScalar(mat, "motor_total_impulse");
+        assertTrue(totalImpulse > 0, "motor_total_impulse must be positive (got " + totalImpulse + ")");
+
+        double avgThrust = getScalar(mat, "motor_avg_thrust");
+        assertTrue(avgThrust > 0, "motor_avg_thrust must be positive");
+
+        double maxThrust = getScalar(mat, "motor_max_thrust");
+        assertTrue(maxThrust >= avgThrust, "motor_max_thrust must be >= avg_thrust");
+
+        Char impulseClass = mat.getChar("motor_impulse_class");
+        assertNotNull(impulseClass, "motor_impulse_class must exist");
+
+        // Motor identity in meta struct too
+        Struct meta = mat.getStruct("meta");
+        assertNotNull(meta.getChar("motor_manufacturer"), "meta.motor_manufacturer must exist");
+        assertNotNull(meta.getChar("motor_type"), "meta.motor_type must exist");
+
+        mat.close();
+    }
+
+    @Test
+    @Order(19)
+    @DisplayName("Scenario and wind fields are exported")
+    void testScenarioFields() throws Exception {
+        String orkFile = EXAMPLES_DIR + "A simple model rocket.ork";
+        String matPath = tempDir.resolve("scenario.mat").toString();
+
+        int exitCode = runExporter(orkFile, matPath);
+        assertEquals(0, exitCode, "Exporter should succeed");
+
+        Mat5File mat = loadMat(matPath);
+
+        // Wind fields
+        double windSpeed = getScalar(mat, "wind_speed_avg");
+        assertTrue(windSpeed >= 0, "wind_speed_avg must be non-negative");
+
+        double windDir = getScalar(mat, "wind_direction");
+        assertFalse(Double.isNaN(windDir), "wind_direction must not be NaN");
+
+        double turbulence = getScalar(mat, "wind_turbulence_intensity");
+        assertTrue(turbulence >= 0 && turbulence <= 1.0,
+                "wind_turbulence_intensity should be in [0,1] (got " + turbulence + ")");
+
+        // ISA and humidity
+        double isa = getScalar(mat, "isa_atmosphere");
+        assertTrue(isa == 0.0 || isa == 1.0, "isa_atmosphere must be 0 or 1");
+
+        double humidity = getScalar(mat, "launch_relative_humidity");
+        assertTrue(humidity >= 0 && humidity <= 1.0,
+                "launch_relative_humidity should be in [0,1] (got " + humidity + ")");
+
+        // Scenario-prefixed aliases
+        assertEquals(windSpeed, getScalar(mat, "scenario_wind_speed"), 1e-9,
+                "scenario_wind_speed must equal wind_speed_avg");
+        assertEquals(getScalar(mat, "launch_altitude"), getScalar(mat, "scenario_launch_altitude"), 1e-9,
+                "scenario_launch_altitude must equal launch_altitude");
+
+        mat.close();
+    }
+
+    @Test
+    @Order(20)
+    @DisplayName("3x3 inertia tensor has correct shape")
+    void testInertiaTensor() throws Exception {
+        String orkFile = EXAMPLES_DIR + "A simple model rocket.ork";
+        String matPath = tempDir.resolve("tensor.mat").toString();
+
+        int exitCode = runExporter(orkFile, matPath);
+        assertEquals(0, exitCode, "Exporter should succeed");
+
+        Mat5File mat = loadMat(matPath);
+
+        Matrix tensor = mat.getMatrix("I_tensor_vs_time");
+        assertNotNull(tensor, "I_tensor_vs_time must exist");
+
+        int[] dims = tensor.getDimensions();
+        assertEquals(3, dims.length, "I_tensor_vs_time must be 3D");
+        assertEquals(3, dims[0], "I_tensor dim 1 must be 3");
+        assertEquals(3, dims[1], "I_tensor dim 2 must be 3");
+        assertTrue(dims[2] >= 2, "I_tensor must have multiple time steps");
+
+        // Check diagonal is positive at t=0
+        double ixx0 = tensor.getDouble(new int[]{0, 0, 0});
+        double iyy0 = tensor.getDouble(new int[]{1, 1, 0});
+        double izz0 = tensor.getDouble(new int[]{2, 2, 0});
+        assertTrue(ixx0 >= 0, "I_tensor(1,1,1) = Ixx must be non-negative");
+        assertTrue(iyy0 >= 0, "I_tensor(2,2,1) = Iyy must be non-negative");
+        assertTrue(izz0 >= 0, "I_tensor(3,3,1) = Izz must be non-negative");
+
+        // Off-diagonals should be zero
+        assertEquals(0.0, tensor.getDouble(new int[]{0, 1, 0}), 1e-15, "I_tensor(1,2) must be 0");
+        assertEquals(0.0, tensor.getDouble(new int[]{1, 0, 0}), 1e-15, "I_tensor(2,1) must be 0");
+        assertEquals(0.0, tensor.getDouble(new int[]{0, 2, 0}), 1e-15, "I_tensor(1,3) must be 0");
+        assertEquals(0.0, tensor.getDouble(new int[]{2, 0, 0}), 1e-15, "I_tensor(3,1) must be 0");
+
+        // Diagonal should match separate Ixx/Iyy/Izz arrays
+        double[] ixxArr = getRow(mat, "Ixx_vs_time");
+        assertEquals(ixxArr[0], ixx0, 1e-12,
+                "I_tensor(1,1,1) must match Ixx_vs_time(1)");
+
+        mat.close();
+    }
+
+    @Test
+    @Order(21)
+    @DisplayName("Invalid sim index lists available simulations")
+    void testSimListOnInvalidIndex() throws Exception {
+        String orkFile = EXAMPLES_DIR + "A simple model rocket.ork";
+        String matPath = tempDir.resolve("invalid_sim.mat").toString();
+
+        // Use an out-of-range sim index
+        int exitCode = runExporter(orkFile, matPath, "--sim", "999");
+        assertEquals(1, exitCode, "Should fail with invalid sim index");
+        assertFalse(new File(matPath).exists(), "No MAT file should be created");
+    }
+
+    @Test
+    @Order(22)
+    @DisplayName("Rail exit velocity is exported with --run-sim")
+    void testRailExitData() throws Exception {
+        String orkFile = EXAMPLES_DIR + "A simple model rocket.ork";
+        String matPath = tempDir.resolve("rail_exit.mat").toString();
+
+        int exitCode = runExporter(orkFile, matPath, "--run-sim");
+        assertEquals(0, exitCode, "Exporter with --run-sim should succeed");
+
+        Mat5File mat = loadMat(matPath);
+
+        double railExitVel = getScalar(mat, "or_rail_exit_velocity");
+        assertTrue(railExitVel > 0 && railExitVel < 200,
+                "Rail exit velocity should be reasonable (got " + railExitVel + " m/s)");
 
         mat.close();
     }
