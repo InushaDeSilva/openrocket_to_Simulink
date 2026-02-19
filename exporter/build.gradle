@@ -1,0 +1,56 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.gradleup.shadow'
+}
+
+java {
+    modularity.inferModulePath = false
+}
+
+application {
+    mainClass = 'info.openrocket.exporter.OrkExporter'
+}
+
+repositories {
+    mavenCentral()
+    maven { url = "https://jitpack.io" }
+}
+
+dependencies {
+    implementation project(':core')
+
+    // Mat-File IO for writing MATLAB .mat files (MAT5 format)
+    implementation 'us.hebi.matlab:mat-file-io:0.4.1'
+
+    // CLI argument parsing
+    implementation 'info.picocli:picocli:4.7.6'
+
+    // Guice (already a transitive dep of core, but declare explicitly)
+    implementation 'com.google.inject:guice:7.0.0'
+
+    // SLF4J + Logback (match core)
+    implementation 'org.slf4j:slf4j-api:2.0.17'
+    implementation 'ch.qos.logback:logback-classic:1.5.20'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:6.0.1'
+    testImplementation 'org.junit.jupiter:junit-jupiter-engine:6.0.1'
+
+    // Access core test utilities (ServicesForTesting, etc.)
+    testImplementation project(':core').sourceSets.test.output
+    // Mat file reading for verification
+    testImplementation 'us.hebi.matlab:mat-file-io:0.4.1'
+}
+
+shadowJar {
+    archiveBaseName = 'ork-exporter'
+    archiveVersion = ''
+    archiveClassifier = ''
+
+    // Merge service files so Guice, SLF4J, etc. work correctly
+    mergeServiceFiles()
+}
+
+test {
+    useJUnitPlatform()
+}

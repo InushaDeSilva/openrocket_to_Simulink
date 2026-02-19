@@ -7,3 +7,4 @@ rootProject.name = 'info.openrocket'
 
 include ':core'
 include ':swing'
+include ':exporter'

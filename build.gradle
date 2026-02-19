@@ -70,13 +70,17 @@ allprojects {
 
 subprojects {
     apply plugin: 'java'
-    apply plugin: "org.javamodularity.moduleplugin"
     apply plugin: 'jacoco'
 
-    // Configure the gradle-modules-plugin
-    modularity {
-        standardJavaRelease(17) // For targeting Java 17
-        modularity.patchModule("java.scripting", "script-api-1.0.jar")
+    // Skip module plugin for exporter (non-modular subproject)
+    if (project.name != 'exporter') {
+        apply plugin: "org.javamodularity.moduleplugin"
+
+        // Configure the gradle-modules-plugin
+        modularity {
+            standardJavaRelease(17) // For targeting Java 17
+            modularity.patchModule("java.scripting", "script-api-1.0.jar")
+        }
     }
 
     test {
